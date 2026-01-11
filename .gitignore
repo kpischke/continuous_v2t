@@ -22,6 +22,15 @@ env/
 Thumbs.db
 
 # Project specific
+internaldocs/
 mic_test.wav
 *.wav
 *.log
+
+# Microsoft Office temp files
+~$*.docx
+~$*.xlsx
+
+# Backup files
+*.kuddelmuddel
+*.bak
