@@ -1,0 +1,23 @@
+# GUI
+PySide6>=6.6.0
+
+# Networking (optional)
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Audio/STT - EXAKTE Versionen
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+whisperx==3.7.4
+numpy>=2.0.2,<2.1.0
+pandas>=2.2.3,<2.3.0
+
+# Utilities
+soundfile>=0.12.1
+loguru>=0.7.2
+omegaconf>=2.3.0
+
+# Packaging
+pyinstaller>=6.3.0
+
