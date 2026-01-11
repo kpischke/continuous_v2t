@@ -75,6 +75,9 @@ class MainWindow(QMainWindow):
 
         self.btn_clear = QPushButton("Transkript löschen")
         self.btn_export = QPushButton("Exportieren…")
+        
+        self.btn_mic_test = QPushButton("Mikrofon-Test (5 Sek.)")
+        left_layout.addWidget(self.btn_mic_test)
 
         left_layout.addWidget(lbl_calls)
         left_layout.addWidget(self.calls_list)
@@ -130,7 +133,8 @@ class MainWindow(QMainWindow):
         self.btn_transcribe_file.clicked.connect(self._transcribe_audio_file)
         self.btn_clear.clicked.connect(self._clear_transcript)
         self.btn_export.clicked.connect(self._export_transcript)
-
+        self.btn_mic_test.clicked.connect(self._test_microphone)
+        
         # Bus signals (from workers)
         self.bus.new_text.connect(self._on_new_text)
         self.bus.status.connect(self._on_status)
@@ -251,11 +255,11 @@ class MainWindow(QMainWindow):
         self._clear_transcript()
 
         cfg = WhisperXConfig(
-            model_size="small",
+            model_size="medium",
             language="de",
             device="cpu",
             compute_type="int8",
-            batch_size=8,
+            batch_size=4,  # Kleiner wegen größerem Modell
         )
 
         self.btn_transcribe_file.setEnabled(False)
@@ -356,6 +360,55 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
+    def _test_microphone(self):
+        from app.audio_capture import MicrophoneCapture
+        import wave
+        
+        self.bus.status.emit("Mikrofon: Aufnahme läuft (10 Sek.) - JETZT SPRECHEN!")
+        self.btn_mic_test.setEnabled(False)
+        
+        def capture_and_transcribe():
+            mic = MicrophoneCapture()
+            mic.start()
+            
+            import time
+            time.sleep(10)
+            mic.stop()
+            
+            # Audio zusammensetzen
+            chunks = []
+            while not mic.audio_queue.empty():
+                chunks.append(mic.audio_queue.get())
+            
+            if chunks:
+                audio_data = b''.join(chunks)
+                
+                # Als WAV speichern
+                test_path = "mic_test.wav"
+                with wave.open(test_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(audio_data)
+                
+                # Transkribieren
+                self.bus.status.emit(f"Mikrofon: Gespeichert, starte Transkription...")
+                self._transcribe_audio_file_direct(test_path)
+            else:
+                self.bus.status.emit("Mikrofon: Keine Daten erfasst")
+            
+            # Button wieder aktivieren
+            self._enable_mic_button_safe()
+        
+        import threading
+        threading.Thread(target=capture_and_transcribe, daemon=True).start()
+
+    def _enable_mic_button_safe(self):
+        QMetaObject.invokeMethod(self, "_enable_mic_button", Qt.QueuedConnection)
+
+    @Slot()
+    def _enable_mic_button(self):
+        self.btn_mic_test.setEnabled(True)
 
 def main() -> int:
     app = QApplication(sys.argv)
@@ -363,17 +416,21 @@ def main() -> int:
     win = MainWindow(bus)
     win.show()
     
-    # CLI-Parameter oder Hardcoded-Test
+def main() -> int:
+    app = QApplication(sys.argv)
+    bus = TranscriptBus()
+    win = MainWindow(bus)
+    win.show()
+    
+    # CLI-Parameter (nur wenn explizit angegeben)
     if len(sys.argv) > 1:
         test_file = sys.argv[1]
-    else:
-        test_file = r"C:\temp\BayrischTest.wav"
+        if os.path.exists(test_file):
+            QTimer.singleShot(500, lambda: win._transcribe_audio_file_direct(test_file))
+        else:
+            print(f"Warnung: Datei nicht gefunden: {test_file}")
     
-    # Auto-start Transkription wenn Datei existiert
-    if os.path.exists(test_file):
-        QTimer.singleShot(500, lambda: win._transcribe_audio_file_direct(test_file))
-    
-    return app.exec()
+    return app.exec()    
 
 
 if __name__ == "__main__":
