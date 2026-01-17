@@ -13,6 +13,9 @@ whisperx==3.7.4
 numpy>=2.0.2,<2.1.0
 pandas>=2.2.3,<2.3.0
 pyaudio>=0.2.13
+noisereduce
+pyannote-audio>=3.3.2,<4.0.0
+huggingface-hub>=0.34.0,<1.0
 
 # Utilities
 soundfile>=0.12.1

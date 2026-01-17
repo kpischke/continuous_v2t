@@ -6,6 +6,96 @@ import os
 import threading
 from datetime import datetime
 
+# ---------------- Feature Flags ----------------
+# Schalte hier Funktionen/Buttons ein oder aus, ohne Code zu löschen.
+ENABLE_DEMO = False
+ENABLE_FILE_TRANSCRIBE = False
+ENABLE_MIC_TEST = False
+ENABLE_LIVE_TRANSCRIBE = True
+# ------------------------------------------------
+
+# stuff for logging
+import logging
+import warnings
+from logging.handlers import RotatingFileHandler
+
+
+def setup_logging_and_warnings():
+    # 1) Logfile (global)
+    log_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.log"))
+    file_handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+
+    # 2) Konsole NUR ERROR
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)  # ins File darf INFO rein
+    # doppelte Handler vermeiden
+    if not root.handlers:
+        root.addHandler(file_handler)
+        root.addHandler(console_handler)
+
+    # 3) Python warnings -> logging (ins File)
+    logging.captureWarnings(True)
+    pywarn_logger = logging.getLogger("py.warnings")
+    pywarn_logger.setLevel(logging.WARNING)
+    # sicherstellen, dass warnings auch im File landen
+    if not any(isinstance(h, RotatingFileHandler) for h in pywarn_logger.handlers):
+        pywarn_logger.addHandler(file_handler)
+
+    # 4) Konkrete Warnungen optional komplett unterdrücken (wenn du sie NIE sehen willst)
+    # warnings.filterwarnings(
+    #     "ignore",
+    #     message=r".*torchaudio\._backend\.list_audio_backends has been deprecated.*",
+    #     category=UserWarning,
+    # )
+
+    # 5) WhisperX/Pyannote/Speechbrain Logger-Level feinjustieren
+    for name in [
+        "whisperx",
+        "whisperx.vads.silero",
+        "pyannote",
+        "pyannote.audio",
+        "speechbrain",
+        "torchaudio",
+    ]:
+        logging.getLogger(name).setLevel(logging.INFO)
+
+    # Beispiel: Silero-VAD Meldungen ausblenden (nur ERROR)
+    logging.getLogger("whisperx.vads.silero").setLevel(logging.ERROR)
+
+    return log_path
+
+
+APP_LOG_PATH = setup_logging_and_warnings()
+
+import sys
+import logging
+
+class StreamToLogger:
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, msg):
+        msg = msg.strip()
+        if msg:
+            self.logger.log(self.level, msg)
+
+    def flush(self):
+        pass
+
+# stdout / stderr in Logging umleiten
+stdout_logger = logging.getLogger("stdout")
+stderr_logger = logging.getLogger("stderr")
+
+sys.stdout = StreamToLogger(stdout_logger, logging.INFO)
+sys.stderr = StreamToLogger(stderr_logger, logging.WARNING)
+
+
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QTimer, QMetaObject
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -26,6 +116,7 @@ from PySide6.QtWidgets import (
 
 from app.stt_whisperx import WhisperXConfig, WhisperXTranscriber
 
+
 class TranscriptBus(QObject):
     """
     Thread-safe Bridge: background workers -> GUI.
@@ -41,12 +132,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.bus = bus
 
-        self.setWindowTitle("continuous_v2t – Demo GUI (WhisperX Offline STT)")
+        self.setWindowTitle("continuous_v2t – GUI")
         self.resize(1100, 650)
 
         self._current_call_label = "Kein aktiver Call"
         self._transcript_lines: list[str] = []
         self._last_error: str = ""
+
+        # Optional: LiveTranscriber holder
+        self._live_transcriber = None
 
         self._build_ui()
         self._connect_signals()
@@ -67,24 +161,47 @@ class MainWindow(QMainWindow):
         self.calls_list = QListWidget()
         self.calls_list.addItem("— (noch keine Einträge) —")
 
-        self.btn_start_demo = QPushButton("Demo-Transkription starten")
-        self.btn_stop_demo = QPushButton("Demo-Transkription stoppen")
-        self.btn_stop_demo.setEnabled(False)
+        # Buttons (Feature Flags)
+        self.btn_start_demo = None
+        self.btn_stop_demo = None
+        self.btn_transcribe_file = None
+        self.btn_mic_test = None
+        self.btn_live_transcribe = None
 
-        self.btn_transcribe_file = QPushButton("Audio transkribieren…")
+        if ENABLE_DEMO:
+            self.btn_start_demo = QPushButton("Demo-Transkription starten")
+            self.btn_stop_demo = QPushButton("Demo-Transkription stoppen")
+            self.btn_stop_demo.setEnabled(False)
+
+        if ENABLE_FILE_TRANSCRIBE:
+            self.btn_transcribe_file = QPushButton("Audio transkribieren…")
+
+        if ENABLE_MIC_TEST:
+            self.btn_mic_test = QPushButton("Mikrofon-Test (10 Sek.)")
+
+        if ENABLE_LIVE_TRANSCRIBE:
+            self.btn_live_transcribe = QPushButton("▶ Live-Transkription")
+            self.btn_live_transcribe.setCheckable(True)
 
         self.btn_clear = QPushButton("Transkript löschen")
         self.btn_export = QPushButton("Exportieren…")
-        
-        self.btn_mic_test = QPushButton("Mikrofon-Test (5 Sek.)")
-        left_layout.addWidget(self.btn_mic_test)
 
+        # Layout zusammenbauen
         left_layout.addWidget(lbl_calls)
         left_layout.addWidget(self.calls_list)
         left_layout.addSpacing(10)
-        left_layout.addWidget(self.btn_start_demo)
-        left_layout.addWidget(self.btn_stop_demo)
-        left_layout.addWidget(self.btn_transcribe_file)
+
+        if self.btn_start_demo is not None:
+            left_layout.addWidget(self.btn_start_demo)
+        if self.btn_stop_demo is not None:
+            left_layout.addWidget(self.btn_stop_demo)
+        if self.btn_transcribe_file is not None:
+            left_layout.addWidget(self.btn_transcribe_file)
+        if self.btn_mic_test is not None:
+            left_layout.addWidget(self.btn_mic_test)
+        if self.btn_live_transcribe is not None:
+            left_layout.addWidget(self.btn_live_transcribe)
+
         left_layout.addSpacing(10)
         left_layout.addWidget(self.btn_clear)
         left_layout.addWidget(self.btn_export)
@@ -97,11 +214,16 @@ class MainWindow(QMainWindow):
 
         self.transcript_edit = QPlainTextEdit()
         self.transcript_edit.setReadOnly(True)
-        self.transcript_edit.setPlaceholderText(
-            "Hier erscheint die Transkription.\n"
-            "- Demo schreibt Beispieltext.\n"
-            "- 'Audio transkribieren…' nutzt WhisperX offline."
-        )
+
+        placeholder_lines = ["Hier erscheint die Transkription."]
+        if ENABLE_DEMO:
+            placeholder_lines.append("- Demo schreibt Beispieltext.")
+        if ENABLE_FILE_TRANSCRIBE:
+            placeholder_lines.append("- 'Audio transkribieren…' nutzt WhisperX offline.")
+        if ENABLE_LIVE_TRANSCRIBE:
+            placeholder_lines.append("- 'Live-Transkription' nutzt WhisperX live (Fenster/Overlap).")
+
+        self.transcript_edit.setPlaceholderText("\n".join(placeholder_lines))
 
         right_layout.addWidget(self.lbl_transcript)
         right_layout.addWidget(self.transcript_edit)
@@ -128,13 +250,20 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         # GUI buttons
-        self.btn_start_demo.clicked.connect(self._start_demo)
-        self.btn_stop_demo.clicked.connect(self._stop_demo)
-        self.btn_transcribe_file.clicked.connect(self._transcribe_audio_file)
+        if self.btn_start_demo is not None:
+            self.btn_start_demo.clicked.connect(self._start_demo)
+        if self.btn_stop_demo is not None:
+            self.btn_stop_demo.clicked.connect(self._stop_demo)
+        if self.btn_transcribe_file is not None:
+            self.btn_transcribe_file.clicked.connect(self._transcribe_audio_file)
+        if self.btn_mic_test is not None:
+            self.btn_mic_test.clicked.connect(self._test_microphone)
+        if self.btn_live_transcribe is not None:
+            self.btn_live_transcribe.toggled.connect(self._toggle_live_transcription)
+
         self.btn_clear.clicked.connect(self._clear_transcript)
         self.btn_export.clicked.connect(self._export_transcript)
-        self.btn_mic_test.clicked.connect(self._test_microphone)
-        
+
         # Bus signals (from workers)
         self.bus.new_text.connect(self._on_new_text)
         self.bus.status.connect(self._on_status)
@@ -187,8 +316,14 @@ class MainWindow(QMainWindow):
     # ---------------- Demo generator ----------------
 
     def _start_demo(self) -> None:
-        self.btn_start_demo.setEnabled(False)
-        self.btn_stop_demo.setEnabled(True)
+        if not ENABLE_DEMO:
+            self.bus.status.emit("Demo-Funktion ist deaktiviert.")
+            return
+
+        if self.btn_start_demo is not None:
+            self.btn_start_demo.setEnabled(False)
+        if self.btn_stop_demo is not None:
+            self.btn_stop_demo.setEnabled(True)
 
         self.bus.call_started.emit("Demo-Call: +49 30 123456 (simuliert)")
         self._append_transcript("[Info] Demo-Transkription gestartet …")
@@ -218,11 +353,16 @@ class MainWindow(QMainWindow):
         self._demo_idx += 1
 
     def _stop_demo(self) -> None:
+        if not ENABLE_DEMO:
+            return
+
         if hasattr(self, "_demo_timer") and self._demo_timer.isActive():
             self._demo_timer.stop()
 
-        self.btn_start_demo.setEnabled(True)
-        self.btn_stop_demo.setEnabled(False)
+        if self.btn_start_demo is not None:
+            self.btn_start_demo.setEnabled(True)
+        if self.btn_stop_demo is not None:
+            self.btn_stop_demo.setEnabled(False)
 
         self._append_transcript("[Info] Demo-Transkription beendet.")
         self.bus.call_ended.emit("Demo-Call")
@@ -231,6 +371,10 @@ class MainWindow(QMainWindow):
     # ---------------- WhisperX file transcription ----------------
 
     def _transcribe_audio_file(self) -> None:
+        if not ENABLE_FILE_TRANSCRIBE:
+            self.bus.status.emit("Datei-Transkription ist deaktiviert.")
+            return
+
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Audio auswählen",
@@ -239,7 +383,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        
+
         self._transcribe_audio_file_direct(path)
 
     def _transcribe_audio_file_direct(self, path: str) -> None:
@@ -247,9 +391,9 @@ class MainWindow(QMainWindow):
         if not path or not os.path.exists(path):
             self.bus.status.emit(f"Datei nicht gefunden: {path}")
             return
-        
+
         # Stop demo if running
-        if hasattr(self, "_demo_timer") and self._demo_timer.isActive():
+        if ENABLE_DEMO and hasattr(self, "_demo_timer") and self._demo_timer.isActive():
             self._stop_demo()
 
         self._clear_transcript()
@@ -259,10 +403,12 @@ class MainWindow(QMainWindow):
             language="de",
             device="cpu",
             compute_type="int8",
-            batch_size=4,  # Kleiner wegen größerem Modell
+            batch_size=4,
         )
 
-        self.btn_transcribe_file.setEnabled(False)
+        if self.btn_transcribe_file is not None:
+            self.btn_transcribe_file.setEnabled(False)
+
         self.bus.status.emit("WhisperX: Transkription gestartet …")
         self.bus.call_started.emit(f"Datei: {path}")
 
@@ -298,7 +444,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _enable_transcribe_button(self):
-        self.btn_transcribe_file.setEnabled(True)
+        if self.btn_transcribe_file is not None:
+            self.btn_transcribe_file.setEnabled(True)
 
     def _show_error_safe(self, msg: str):
         self._last_error = msg
@@ -338,12 +485,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export fehlgeschlagen", str(e))
 
     def _show_about(self) -> None:
+        features = []
+        if ENABLE_DEMO:
+            features.append("Demo")
+        if ENABLE_FILE_TRANSCRIBE:
+            features.append("Datei")
+        if ENABLE_MIC_TEST:
+            features.append("Mikrofon-Test")
+        if ENABLE_LIVE_TRANSCRIBE:
+            features.append("Live")
+        feat_str = ", ".join(features) if features else "(keine)"
+
         QMessageBox.information(
             self,
             "About",
             "continuous_v2t\n\n"
-            "PySide6 GUI Demo für Voice-to-Text.\n"
-            "Aktuell: Offline-Transkription via WhisperX (Datei).\n"
+            "PySide6 GUI für Voice-to-Text.\n"
+            f"Aktive Features: {feat_str}\n"
             "Start: python -m app.main\n",
         )
 
@@ -360,47 +518,53 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
+    # ---------------- Mic test ----------------
+
     def _test_microphone(self):
+        if not ENABLE_MIC_TEST:
+            self.bus.status.emit("Mikrofon-Test ist deaktiviert.")
+            return
+
         from app.audio_capture import MicrophoneCapture
         import wave
-        
+
         self.bus.status.emit("Mikrofon: Aufnahme läuft (10 Sek.) - JETZT SPRECHEN!")
-        self.btn_mic_test.setEnabled(False)
-        
+        if self.btn_mic_test is not None:
+            self.btn_mic_test.setEnabled(False)
+
         def capture_and_transcribe():
             mic = MicrophoneCapture()
             mic.start()
-            
+            time_sleep = 10
             import time
-            time.sleep(10)
+            time.sleep(time_sleep)
             mic.stop()
-            
-            # Audio zusammensetzen
+
             chunks = []
             while not mic.audio_queue.empty():
                 chunks.append(mic.audio_queue.get())
-            
+
             if chunks:
-                audio_data = b''.join(chunks)
-                
-                # Als WAV speichern
+                audio_data = b"".join(chunks)
+
                 test_path = "mic_test.wav"
-                with wave.open(test_path, 'wb') as wf:
+                with wave.open(test_path, "wb") as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)
                     wf.setframerate(16000)
                     wf.writeframes(audio_data)
-                
-                # Transkribieren
-                self.bus.status.emit(f"Mikrofon: Gespeichert, starte Transkription...")
-                self._transcribe_audio_file_direct(test_path)
+
+                self.bus.status.emit("Mikrofon: Gespeichert, starte Transkription...")
+                # nur wenn Datei-Transkription aktiv ist
+                if ENABLE_FILE_TRANSCRIBE:
+                    self._transcribe_audio_file_direct(test_path)
+                else:
+                    self.bus.status.emit(f"Mikrofon: WAV gespeichert ({test_path}), Datei-Transkription ist deaktiviert.")
             else:
                 self.bus.status.emit("Mikrofon: Keine Daten erfasst")
-            
-            # Button wieder aktivieren
+
             self._enable_mic_button_safe()
-        
-        import threading
+
         threading.Thread(target=capture_and_transcribe, daemon=True).start()
 
     def _enable_mic_button_safe(self):
@@ -408,29 +572,79 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _enable_mic_button(self):
-        self.btn_mic_test.setEnabled(True)
+        if self.btn_mic_test is not None:
+            self.btn_mic_test.setEnabled(True)
+
+    # ---------------- Live transcription ----------------
+
+    def _toggle_live_transcription(self, checked: bool):
+        if not ENABLE_LIVE_TRANSCRIBE:
+            self.bus.status.emit("Live-Transkription ist deaktiviert.")
+            return
+
+        if self.btn_live_transcribe is None:
+            return
+
+        if checked:
+            self.btn_live_transcribe.setText("⏹ Live-Transkription stoppen")
+            self._start_live_transcription()
+        else:
+            self.btn_live_transcribe.setText("▶ Live-Transkription")
+            self._stop_live_transcription()
+
+    def _start_live_transcription(self):
+        if not ENABLE_LIVE_TRANSCRIBE:
+            return
+
+        from app.live_transcriber import LiveTranscriber
+
+        cfg = WhisperXConfig(
+            model_size="medium",
+            language="de",
+            device="cpu",
+            compute_type="int8",
+            batch_size=4,
+            vad_options={
+                "threshold": 0.12,
+                "min_speech_duration_ms": 200,
+                "min_silence_duration_ms": 200,
+                "speech_pad_ms": 200,
+            },
+        )
+
+        self._live_transcriber = LiveTranscriber(
+            on_text=lambda text: self.bus.new_text.emit(text) if text else None,
+            on_status=lambda status: self.bus.status.emit(status),
+            config=cfg,
+        )
+        self._live_transcriber.start()
+        self.bus.call_started.emit("Live-Mikrofon")
+
+    def _stop_live_transcription(self):
+        if self._live_transcriber is not None:
+            try:
+                self._live_transcriber.stop()
+            except Exception:
+                pass
+            self._live_transcriber = None
+            self.bus.call_ended.emit("Live-Mikrofon")
+
 
 def main() -> int:
     app = QApplication(sys.argv)
     bus = TranscriptBus()
     win = MainWindow(bus)
     win.show()
-    
-def main() -> int:
-    app = QApplication(sys.argv)
-    bus = TranscriptBus()
-    win = MainWindow(bus)
-    win.show()
-    
-    # CLI-Parameter (nur wenn explizit angegeben)
-    if len(sys.argv) > 1:
+
+    # CLI-Parameter (nur wenn explizit angegeben) – nur sinnvoll, wenn Datei-Transkription aktiv
+    if ENABLE_FILE_TRANSCRIBE and len(sys.argv) > 1:
         test_file = sys.argv[1]
         if os.path.exists(test_file):
             QTimer.singleShot(500, lambda: win._transcribe_audio_file_direct(test_file))
         else:
             print(f"Warnung: Datei nicht gefunden: {test_file}")
-    
-    return app.exec()    
+
+    return app.exec()
 
 
 if __name__ == "__main__":
